@@ -19,7 +19,14 @@ import seaborn as sns
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import KFold, LeaveOneOut, cross_validate, train_test_split
+from sklearn.model_selection import (
+    KFold,
+    LeaveOneOut,
+    ShuffleSplit,
+    cross_validate,
+    cross_val_score,
+    train_test_split,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
@@ -127,6 +134,9 @@ def main() -> None:
 	# Dataset and deterministic fingerprint for reproducibility.
 	tips = sns.load_dataset("tips").dropna(subset=FEATURES + [TARGET]).copy()
 	X, y = tips[FEATURES], tips[TARGET]
+	validation_pipeline = build_pipeline()
+
+
 	data_hash = hashlib.sha256(
 		pd.util.hash_pandas_object(tips, index=True).values.tobytes()
 	).hexdigest()
@@ -186,9 +196,129 @@ def main() -> None:
 	)
 	metrics.update(coefficient_metrics)
 
+    # ------------------------------------------------------------
+    # Additional validation comparison suite
+    # ------------------------------------------------------------
+
+	validation_strategies = {
+		"holdout": ShuffleSplit(
+			n_splits=1,
+			test_size=0.2,
+			random_state=RANDOM_STATE,
+		),
+		"kfold_5": KFold(
+			n_splits=5,
+			shuffle=True,
+			random_state=RANDOM_STATE,
+		),
+		"shufflesplit_10": ShuffleSplit(
+			n_splits=10,
+			test_size=0.2,
+			random_state=RANDOM_STATE,
+		),
+		"leave_one_out": LeaveOneOut(),
+	}
+
+	print("\n--- Comprehensive Validation Suite ---")
+
+	for name, cv_strategy in validation_strategies.items():
+
+		scores = cross_val_score(
+			validation_pipeline,
+			X,
+			y,
+			cv=cv_strategy,
+			scoring="neg_mean_squared_error",
+			n_jobs=-1,
+		)
+
+		mse_mean = -scores.mean()
+		mse_std = scores.std()
+
+		print(
+			f"{name:25} | "
+			f"Average MSE: {mse_mean:.4f} | "
+			f"Std Dev: {mse_std:.4f}"
+		)
+
+		metrics[f"{name}_mse_mean"] = float(mse_mean)
+		metrics[f"{name}_mse_std"] = float(mse_std)
+
+	# ------------------------------------------------------------
+	# Bootstrap validation
+	# ------------------------------------------------------------
+
+	n_bootstraps = 1000
+	bootstrap_mses = []
+
+	rng = np.random.default_rng(RANDOM_STATE)
+
+	for i in range(n_bootstraps):
+
+		train_idx = rng.choice(
+			len(X),
+			size=len(X),
+			replace=True,
+		)
+
+		test_idx = np.setdiff1d(
+			np.arange(len(X)),
+			np.unique(train_idx),
+		)
+
+		if len(test_idx) == 0:
+			continue
+
+		X_train = X.iloc[train_idx]
+		y_train = y.iloc[train_idx]
+
+		X_test = X.iloc[test_idx]
+		y_test = y.iloc[test_idx]
+
+		bootstrap_model = build_pipeline()
+
+		bootstrap_model.fit(X_train, y_train)
+
+		y_pred = bootstrap_model.predict(X_test)
+
+		mse = mean_squared_error(
+			y_test,
+			y_pred,
+		)
+
+		bootstrap_mses.append(mse)
+
+	bootstrap_mean = np.mean(bootstrap_mses)
+	bootstrap_std = np.std(bootstrap_mses)
+
+	bootstrap_lower = np.percentile(
+		bootstrap_mses,
+		2.5,
+	)
+
+	bootstrap_upper = np.percentile(
+		bootstrap_mses,
+		97.5,
+	)
+
+	print(f"\nBootstrap Average MSE: {bootstrap_mean:.4f}")
+	print(f"Bootstrap Std Dev: {bootstrap_std:.4f}")
+	print(
+		f"95% Bootstrap CI: "
+		f"[{bootstrap_lower:.4f}, {bootstrap_upper:.4f}]"
+	)
+
+	metrics["bootstrap_mse_mean"] = float(bootstrap_mean)
+	metrics["bootstrap_mse_std"] = float(bootstrap_std)
+	metrics["bootstrap_ci_lower"] = float(bootstrap_lower)
+	metrics["bootstrap_ci_upper"] = float(bootstrap_upper)
+
 	code_info = provenance()
+
 	mlflow.set_experiment("tips-multivariable-linear-regression")
+
 	with mlflow.start_run() as run:
+
 		mlflow.log_params(
 			{
 				"estimator": "LinearRegression",
@@ -203,7 +333,9 @@ def main() -> None:
 				"dataset_rows": len(tips),
 			}
 		)
+
 		mlflow.log_metrics(metrics)
+
 		mlflow.set_tags(
 			{
 				**code_info,
@@ -211,24 +343,73 @@ def main() -> None:
 				"dataset_sha256": data_hash,
 			}
 		)
+
 		mlflow.log_dict(
 			{**code_info, "dataset": "seaborn.tips", "dataset_sha256": data_hash},
 			"provenance.json",
 		)
-		mlflow.log_dict(coefficient_summaries, "coefficient_stability.json")
 
-		# Refit on all rows for the tracked model artifact after validation.
+		mlflow.log_dict(
+			coefficient_summaries,
+			"coefficient_stability.json",
+		)
+
 		final_model = build_pipeline().fit(X, y)
-		mlflow.sklearn.log_model(final_model, artifact_path="model")
-		with tempfile.TemporaryDirectory() as artifact_dir:
-			coefficient_csv = Path(artifact_dir) / "validation_coefficients.csv"
-			coefficient_frame.to_csv(coefficient_csv, index=False)
-			mlflow.log_artifact(str(coefficient_csv))
 
-			plot_path = Path(artifact_dir) / "coefficient_boxplot.png"
-			fig, axis = plt.subplots(
-				figsize=(12, max(6, 0.5 * coefficient_frame["parameter"].nunique()))
+		mlflow.sklearn.log_model(
+			final_model,
+			artifact_path="model",
+		)
+
+		with tempfile.TemporaryDirectory() as artifact_dir:
+
+			coefficient_csv = (
+				Path(artifact_dir)
+				/ "validation_coefficients.csv"
 			)
+
+			coefficient_frame.to_csv(
+				coefficient_csv,
+				index=False,
+			)
+
+			mlflow.log_artifact(
+				str(coefficient_csv)
+			)
+
+			bootstrap_csv = (
+				Path(artifact_dir)
+				/ "bootstrap_results.csv"
+			)
+
+			pd.DataFrame(
+				{
+					"bootstrap_mse": bootstrap_mses
+				}
+			).to_csv(
+				bootstrap_csv,
+				index=False,
+			)
+
+			mlflow.log_artifact(
+				str(bootstrap_csv)
+			)
+
+			plot_path = (
+				Path(artifact_dir)
+				/ "coefficient_boxplot.png"
+			)
+
+			fig, axis = plt.subplots(
+				figsize=(
+					12,
+					max(
+						6,
+						0.5 * coefficient_frame["parameter"].nunique(),
+					),
+				)
+			)
+
 			sns.boxplot(
 				data=coefficient_frame,
 				x="value",
@@ -236,14 +417,88 @@ def main() -> None:
 				hue="validation_method",
 				ax=axis,
 			)
-			axis.set(title="Regression coefficient stability by validation method")
-			axis.set(xlabel="Coefficient value", ylabel="Parameter")
-			fig.tight_layout()
-			fig.savefig(plot_path, dpi=150)
-			plt.close(fig)
-			mlflow.log_artifact(str(plot_path))
-		print(json.dumps({"run_id": run.info.run_id, "metrics": metrics}, indent=2))
 
+			axis.set(
+				title="Regression coefficient stability by validation method"
+			)
+
+			axis.set(
+				xlabel="Coefficient value",
+				ylabel="Parameter",
+			)
+
+			fig.tight_layout()
+
+			fig.savefig(
+				plot_path,
+				dpi=150,
+			)
+
+			plt.close(fig)
+
+			mlflow.log_artifact(
+				str(plot_path)
+			)
+
+			bootstrap_plot = (
+				Path(artifact_dir)
+				/ "bootstrap_mse_distribution.png"
+			)
+
+			fig, axis = plt.subplots(
+				figsize=(8, 5)
+			)
+
+			axis.hist(
+				bootstrap_mses,
+				bins=30,
+			)
+
+			axis.axvline(
+				bootstrap_lower,
+				color="red",
+				linestyle="--",
+				label="2.5%",
+			)
+
+			axis.axvline(
+				bootstrap_upper,
+				color="red",
+				linestyle="--",
+				label="97.5%",
+			)
+
+			axis.set_title(
+				"Bootstrap MSE Distribution"
+			)
+
+			axis.set_xlabel("MSE")
+			axis.set_ylabel("Frequency")
+
+			axis.legend()
+
+			fig.tight_layout()
+
+			fig.savefig(
+				bootstrap_plot,
+				dpi=150,
+			)
+
+			plt.close(fig)
+
+			mlflow.log_artifact(
+				str(bootstrap_plot)
+			)
+
+		print(
+			json.dumps(
+				{
+					"run_id": run.info.run_id,
+					"metrics": metrics,
+				},
+				indent=2,
+			)
+		)
 
 if __name__ == "__main__":
 	main()
